@@ -4,7 +4,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.50"
+      version = "~> 5.40"
     }
   }
 
@@ -15,9 +15,7 @@ provider "aws" {
   region = var.aws_region
 }
 
-# ──────────────────────────────────────────────
-# Variables
-# ──────────────────────────────────────────────
+# ── Variables ────────────────────────────────────────────────────────────────
 
 variable "aws_region" {
   description = "AWS region to deploy into"
@@ -26,47 +24,33 @@ variable "aws_region" {
 }
 
 variable "function_name" {
-  description = "Name of the Lambda function"
+  description = "Lambda function name"
   type        = string
   default     = "githublamda2"
 }
 
-variable "s3_bucket" {
-  description = "S3 bucket that holds the Lambda zip artifact"
+variable "zip_path" {
+  description = "Local path to the deployment zip artifact"
   type        = string
-}
-
-variable "s3_key" {
-  description = "S3 key of the Lambda zip artifact"
-  type        = string
-  default     = "lambda/package.zip"
+  default     = "function.zip"
 }
 
 variable "app_env" {
-  description = "Value for the APP_ENV environment variable"
+  description = "Application environment"
   type        = string
   default     = "production"
 }
 
-variable "lambda_log_retention_days" {
-  description = "CloudWatch log retention in days"
-  type        = number
-  default     = 14
-}
-
-# ──────────────────────────────────────────────
-# IAM role for Lambda
-# ──────────────────────────────────────────────
+# ── IAM Role ─────────────────────────────────────────────────────────────────
 
 data "aws_iam_policy_document" "lambda_assume_role" {
   statement {
-    effect  = "Allow"
-    actions = ["sts:AssumeRole"]
-
+    effect = "Allow"
     principals {
       type        = "Service"
       identifiers = ["lambda.amazonaws.com"]
     }
+    actions = ["sts:AssumeRole"]
   }
 }
 
@@ -80,32 +64,32 @@ resource "aws_iam_role_policy_attachment" "basic_execution" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-# ──────────────────────────────────────────────
-# CloudWatch log group
-# ──────────────────────────────────────────────
+# ── CloudWatch Log Group ──────────────────────────────────────────────────────
 
 resource "aws_cloudwatch_log_group" "lambda_logs" {
   name              = "/aws/lambda/${var.function_name}"
-  retention_in_days = var.lambda_log_retention_days
+  retention_in_days = 14
 }
 
-# ──────────────────────────────────────────────
-# Lambda function
-# ──────────────────────────────────────────────
+# ── Lambda Function ───────────────────────────────────────────────────────────
 
 resource "aws_lambda_function" "app" {
   function_name = var.function_name
   description   = "FastAPI application wrapped with Mangum"
 
-  role    = aws_iam_role.lambda_exec.arn
-  runtime = "python3.12"
+  # Artifact
+  filename         = var.zip_path
+  source_code_hash = filebase64sha256(var.zip_path)
+
+  # Runtime & handler – MUST match lambda_handler.py::handler = Mangum(app)
+  runtime = "python3.11"
   handler = "lambda_handler.handler"
 
-  s3_bucket = var.s3_bucket
-  s3_key    = var.s3_key
+  role = aws_iam_role.lambda_exec.arn
 
-  timeout     = 30
+  # Sizing
   memory_size = 256
+  timeout     = 30
 
   environment {
     variables = {
@@ -119,9 +103,7 @@ resource "aws_lambda_function" "app" {
   ]
 }
 
-# ──────────────────────────────────────────────
-# Lambda Function URL  (auth = NONE → public)
-# ──────────────────────────────────────────────
+# ── Function URL (sole HTTP entry point – no API Gateway) ─────────────────────
 
 resource "aws_lambda_function_url" "app_url" {
   function_name      = aws_lambda_function.app.function_name
@@ -130,25 +112,14 @@ resource "aws_lambda_function_url" "app_url" {
   cors {
     allow_credentials = false
     allow_origins     = ["*"]
-    allow_methods     = ["*"]
-    allow_headers     = ["*"]
+    allow_methods     = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
+    allow_headers     = ["content-type", "authorization", "x-requested-with", "x-amz-date", "x-api-key"]
+    expose_headers    = ["content-type", "x-custom-header"]
     max_age           = 86400
   }
 }
 
-# Resource-based policy that allows unauthenticated invocations through the
-# Function URL (required when authorization_type = "NONE").
-resource "aws_lambda_permission" "allow_function_url" {
-  statement_id           = "AllowFunctionURLPublicAccess"
-  action                 = "lambda:InvokeFunctionUrl"
-  function_name          = aws_lambda_function.app.function_name
-  principal              = "*"
-  function_url_auth_type = "NONE"
-}
-
-# ──────────────────────────────────────────────
-# Outputs
-# ──────────────────────────────────────────────
+# ── Outputs ───────────────────────────────────────────────────────────────────
 
 output "function_name" {
   description = "Lambda function name"
@@ -161,6 +132,6 @@ output "function_arn" {
 }
 
 output "function_url" {
-  description = "Public Function URL"
+  description = "Lambda Function URL (public HTTPS endpoint)"
   value       = aws_lambda_function_url.app_url.function_url
 }

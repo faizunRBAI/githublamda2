@@ -4,29 +4,46 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: "Type 'destroy' to confirm teardown of all resources"
+        description: "Type 'destroy' to confirm infrastructure teardown"
         required: true
+        default: ""
 
 permissions:
   contents: read
-  id-token: write
 
 env:
   AWS_REGION: us-east-1
-  FUNCTION_NAME: githublamda2
   TF_BACKEND_BUCKET: ${{ secrets.TF_BACKEND_BUCKET }}
-  TF_BACKEND_KEY: ${{ secrets.TF_BACKEND_KEY }}
+  TF_BACKEND_KEY: githublamda2/terraform.tfstate
   TF_BACKEND_REGION: us-east-1
+  FUNCTION_NAME: githublamda2
+  ZIP_NAME: function.zip
 
 jobs:
   destroy:
-    name: Terraform Destroy
+    name: Terraform destroy
     runs-on: ubuntu-latest
-    if: github.event.inputs.confirm == 'destroy'
+    environment: production
+
+    # Safety gate: the manual input must equal 'destroy'
+    if: ${{ github.event.inputs.confirm == 'destroy' }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Terraform needs the zip to compute filebase64sha256(); create a dummy
+      # placeholder so the file reference does not cause an error during destroy.
+      - name: Create placeholder zip for Terraform file reference
+        run: |
+          echo "placeholder" > placeholder.txt
+          zip ${{ env.ZIP_NAME }} placeholder.txt
+          rm placeholder.txt
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -38,22 +55,20 @@ jobs:
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.8.5"
+          terraform_version: "1.7.5"
 
-      - name: Terraform Init
+      - name: Terraform init
         working-directory: terraform
         run: |
-          terraform init \
+          terraform init -reconfigure \
             -backend-config="bucket=${{ env.TF_BACKEND_BUCKET }}" \
-            -backend-config="key=${{ env.TF_BACKEND_KEY }}" \
+            -backend-config="key=${{ env.TF_BACKEND_KEY }}"     \
             -backend-config="region=${{ env.TF_BACKEND_REGION }}"
 
-      - name: Terraform Destroy
+      - name: Terraform destroy
         working-directory: terraform
         run: |-
-          terraform destroy \
-            -auto-approve \
-            -var="s3_bucket=${{ secrets.S3_BUCKET }}" \
-            -var="s3_key=lambda/package.zip" \
-            -var="aws_region=${{ env.AWS_REGION }}" \
-            -var="function_name=${{ env.FUNCTION_NAME }}"
+          terraform destroy -auto-approve \
+            -var="aws_region=${{ env.AWS_REGION }}"          \
+            -var="function_name=${{ env.FUNCTION_NAME }}"    \
+            -var="zip_path=../${{ env.ZIP_NAME }}"

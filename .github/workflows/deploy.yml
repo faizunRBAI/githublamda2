@@ -8,58 +8,52 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # required for OIDC / aws-actions
+  id-token: write   # required for OIDC-based AWS auth (optional but forward-compatible)
 
 env:
   AWS_REGION: us-east-1
-  PYTHON_VERSION: "3.12"
-  S3_BUCKET: ${{ secrets.S3_BUCKET }}
-  S3_KEY: lambda/package.zip
-  FUNCTION_NAME: githublamda2
   TF_BACKEND_BUCKET: ${{ secrets.TF_BACKEND_BUCKET }}
-  TF_BACKEND_KEY: ${{ secrets.TF_BACKEND_KEY }}
+  TF_BACKEND_KEY: githublamda2/terraform.tfstate
   TF_BACKEND_REGION: us-east-1
+  FUNCTION_NAME: githublamda2
+  PYTHON_VERSION: "3.11"
+  ZIP_NAME: function.zip
 
 jobs:
-  # ────────────────────────────────────────────
-  # Job 1 — Test
-  # ────────────────────────────────────────────
+  # ── 1. Test ────────────────────────────────────────────────────────────────
   test:
     name: Test
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
 
-      - name: Install dependencies
+      - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-cov httpx
+          pip install pytest httpx pytest-cov
 
       - name: Run tests
         run: |
-          pytest --cov=app --cov-report=term-missing --cov-fail-under=0 -v || true
-          # Replace --cov-fail-under=0 with your real threshold once tests exist.
-          # Do NOT lower an existing threshold.
+          pytest --tb=short --cov=app --cov-report=term-missing --cov-fail-under=0 || true
+          # If a tests/ directory exists, pytest will discover and run them;
+          # --cov-fail-under=0 keeps the gate permissive until real tests are added.
 
-  # ────────────────────────────────────────────
-  # Job 2 — Build & upload zip to S3
-  # ────────────────────────────────────────────
+  # ── 2. Build ───────────────────────────────────────────────────────────────
   build:
-    name: Build & Upload
+    name: Build zip artifact
     runs-on: ubuntu-latest
     needs: test
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
@@ -67,68 +61,58 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Build Lambda zip package
+      - name: Install runtime dependencies into staging directory
         run: |
-          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -t ./package/
 
-          BUILD_DIR="$(pwd)/.build/package"
-          mkdir -p "$BUILD_DIR"
+      - name: Copy application source into staging directory
+        run: |
+          # Copy top-level handler and source tree into the package root
+          cp lambda_handler.py ./package/
+          cp -r app/            ./package/app/
 
-          # Install runtime dependencies into the package root
-          pip install --upgrade pip
-          pip install \
-            --target "$BUILD_DIR" \
-            --platform linux_x86_64 \
-            --implementation cp \
-            --python-version 3.12 \
-            --only-binary=:all: \
-            --upgrade \
-            -r requirements.txt
-
-          # Copy application source into the package root
-          cp lambda_handler.py "$BUILD_DIR/"
-          cp -r app/            "$BUILD_DIR/app"
-
-          # Include public/ assets if they exist (guarded by app/main.py at runtime)
-          if [ -d "public" ]; then
-            cp -r public/ "$BUILD_DIR/public"
+          # Include public/ only if it exists (StaticFiles mount is guarded)
+          if [ -d public ]; then
+            cp -r public/ ./package/public/
           fi
 
-          # Create the zip archive
-          cd "$BUILD_DIR"
-          zip -r9 "../../lambda_package.zip" .
-
-      - name: Upload zip to S3
+      - name: Create deployment zip
         run: |
-          aws s3 cp .build/lambda_package.zip \
-            "s3://${{ env.S3_BUCKET }}/${{ env.S3_KEY }}" \
-            --region "${{ env.AWS_REGION }}"
+          cd package
+          zip -r9 ../${{ env.ZIP_NAME }} .
+          cd ..
+          echo "Zip size: $(du -sh ${{ env.ZIP_NAME }})"
+          echo "SHA256:   $(sha256sum ${{ env.ZIP_NAME }})"
 
-      - name: Upload zip as workflow artifact
+      - name: Upload zip artifact
         uses: actions/upload-artifact@v4
         with:
           name: lambda-package
-          path: .build/lambda_package.zip
-          retention-days: 7
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 5
 
-  # ────────────────────────────────────────────
-  # Job 3 — Terraform apply + update function code
-  # ────────────────────────────────────────────
+  # ── 3. Deploy ──────────────────────────────────────────────────────────────
   deploy:
-    name: Deploy (Terraform)
+    name: Terraform deploy
     runs-on: ubuntu-latest
     needs: build
+    environment: production
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download zip artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: lambda-package
+          # Downloads function.zip into the workspace root
+
+      - name: Verify artifact exists
+        run: |
+          ls -lh ${{ env.ZIP_NAME }}
+          test -f ${{ env.ZIP_NAME }}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -140,52 +124,33 @@ jobs:
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.8.5"
+          terraform_version: "1.7.5"
 
-      - name: Terraform Init
+      - name: Terraform init
         working-directory: terraform
         run: |
-          terraform init \
+          terraform init -reconfigure \
             -backend-config="bucket=${{ env.TF_BACKEND_BUCKET }}" \
-            -backend-config="key=${{ env.TF_BACKEND_KEY }}" \
+            -backend-config="key=${{ env.TF_BACKEND_KEY }}"     \
             -backend-config="region=${{ env.TF_BACKEND_REGION }}"
 
-      - name: Terraform Validate
+      - name: Terraform validate
         working-directory: terraform
         run: terraform validate
 
-      - name: Terraform Plan
+      - name: Terraform plan
         working-directory: terraform
         run: |
           terraform plan \
-            -var="s3_bucket=${{ env.S3_BUCKET }}" \
-            -var="s3_key=${{ env.S3_KEY }}" \
-            -var="aws_region=${{ env.AWS_REGION }}" \
-            -var="function_name=${{ env.FUNCTION_NAME }}" \
+            -var="aws_region=${{ env.AWS_REGION }}"          \
+            -var="function_name=${{ env.FUNCTION_NAME }}"    \
+            -var="zip_path=../${{ env.ZIP_NAME }}"           \
             -out=tfplan
 
-      - name: Terraform Apply
+      - name: Terraform apply
         working-directory: terraform
         run: terraform apply -auto-approve tfplan
 
-      - name: Update Lambda function code
-        # Ensures the function is pointing at the newly uploaded zip.
-        # This is a no-op if Terraform already updated the code, but it
-        # guarantees the handler string is resolvable immediately after deploy.
-        run: |
-          aws lambda update-function-code \
-            --function-name "${{ env.FUNCTION_NAME }}" \
-            --s3-bucket     "${{ env.S3_BUCKET }}" \
-            --s3-key        "${{ env.S3_KEY }}" \
-            --region        "${{ env.AWS_REGION }}"
-
-      - name: Wait for function update to complete
-        run: |
-          aws lambda wait function-updated \
-            --function-name "${{ env.FUNCTION_NAME }}" \
-            --region        "${{ env.AWS_REGION }}"
-
       - name: Print Function URL
         working-directory: terraform
-        run: |-
-          terraform output -raw function_url || true
+        run: terraform output -raw function_url
